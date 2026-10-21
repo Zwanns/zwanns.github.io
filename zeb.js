@@ -1,5 +1,5 @@
 
-/* Lampa Online v0.1.1 — Filmix provider preview.
+/* Lampa Online v0.1.2 — Filmix provider preview.
  * Standalone ES5 plugin. The Filmix API/network is not verified on user device.
  * Additional providers intentionally not implemented yet.
  */
@@ -119,6 +119,29 @@
         if (window.console && console.log) console.log('LampaOnline', stage, code || '');
     }
 
+    function looksLikeFilmix(stage, data) {
+        if (stage === 'search') {
+            return Array.isArray(data) && (!data.length || data.some(function (item) {
+                return item && /^\d+$/.test(String(item.id));
+            }));
+        }
+        if (!data || typeof data !== 'object' || Array.isArray(data) || data.error || data.errors) return false;
+        if (stage === 'post') return !!data.player_links && typeof data.player_links === 'object' && !Array.isArray(data.player_links);
+        var p = data.user_data || data;
+        return !!p && typeof p === 'object' && !Array.isArray(p) &&
+            !!(p.user_id || p.login || p.is_pro != null || p.is_pro_plus != null);
+    }
+
+    function networkLog(stage, result, status, kind, json, filmix) {
+        // Fixed endpoint labels and allowlisted outcomes only; never pass URLs/data/errors.
+        stage = stage === 'search' || stage === 'user_profile' ? stage : 'post';
+        status = Number(status);
+        if (!(status >= 100 && status <= 599 && status === Math.floor(status))) status = 0;
+        kind = /^(timeout|error|parsererror|abort)$/.test(kind) ? kind : (kind ? 'error' : 'none');
+        if (window.console && console.log) console.log('LampaOnline | network | ' + stage + ' | ' + result +
+            ' http=' + status + ' error=' + kind + ' json=' + json + ' filmix=' + filmix);
+    }
+
     function errorText(status, kind) {
         if (kind === 'timeout') return tr('timeout');
         if (kind === 'parsererror') return tr('bad_json');
@@ -132,24 +155,35 @@
     // Reguest logs credential-bearing URLs and clear() does not abort HTTP.
     // Use Lampa's existing jQuery with an owned, cancellable request instead.
     function Network(timeout) {
-        var xhr = null, timer = null, generation = 0;
+        var xhr = null, timer = null, generation = 0, cancel = null;
         this.clear = function () {
             generation++;
             clearTimeout(timer);
             timer = null;
+            if (cancel) cancel();
+            cancel = null;
             var previous = xhr;
             xhr = null;
             if (previous && previous.abort) previous.abort();
         };
-        this.get = function (url, success, failure) {
+        this.get = function (url, stage, success, failure) {
             this.clear();
             var current = generation, done = false;
-            function finish(data, status, kind) {
+            networkLog(stage, 'start', 0, '', 'unknown', 'unknown');
+            cancel = function () {
+                if (done) return;
+                done = true;
+                networkLog(stage, 'complete', 0, 'abort', 'unknown', 'unknown');
+            };
+            function finish(data, status, kind, json) {
                 if (done || current !== generation) return;
                 done = true;
+                cancel = null;
                 clearTimeout(timer);
                 timer = null;
                 xhr = null;
+                networkLog(stage, 'complete', status, kind, json === undefined ? 'unknown' : json,
+                    json === true ? looksLikeFilmix(stage, data) : (json === false ? false : 'unknown'));
                 if (kind) failure(status || 0, kind);
                 else success(data);
             }
@@ -162,17 +196,19 @@
                 var pending = $.ajax({
                     url: url, type: 'GET', dataType: 'text', timeout: timeout,
                     crossDomain: true, global: false,
-                    success: function (text) {
-                        var data;
+                    success: function (text, textStatus, response) {
+                        var data, status = Number(response && response.status) || 0;
                         try { data = typeof text === 'string' ? JSON.parse(text) : text; }
-                        catch (ignored) { finish(null, 0, 'parsererror'); return; }
-                        if (!data || typeof data !== 'object') { finish(null, 0, 'parsererror'); return; }
-                        finish(data);
+                        catch (ignored) { finish(null, status, 'parsererror', false); return; }
+                        finish(data, status, '', true);
                     },
-                    error: function (response, kind) { finish(null, Number(response && response.status) || 0, kind || 'network'); }
+                    error: function (response, kind) {
+                        kind = /^(timeout|error|parsererror|abort)$/.test(kind) ? kind : 'error';
+                        finish(null, Number(response && response.status) || 0, kind, kind === 'parsererror' ? false : undefined);
+                    }
                 });
                 if (!done && current === generation) xhr = pending;
-            } catch (ignored) { finish(null, 0, 'network'); }
+            } catch (ignored) { finish(null, 0, 'error'); }
         };
     }
 
@@ -272,12 +308,10 @@
             network.clear();
             try { url = apiUrl(path, extra); }
             catch (e) { onError(e.message); return; }
-            log(path === 'search' ? 'search.start' : 'post.start');
-            network.get(url, function (data) {
+            network.get(url, path === 'search' ? 'search' : 'post', function (data) {
                 if (alive && seq === requestSeq) success(data);
             }, function (status, kind) {
                 if (!alive || seq !== requestSeq) return;
-                log(path === 'search' ? 'search.error' : 'post.error', status);
                 onError(errorText(status, kind));
             });
         }
@@ -286,23 +320,21 @@
             if (!setting('token', '')) { complete(); return; }
             var url;
             try { url = apiUrl('user_profile'); } catch (e) { complete(); return; }
-            log('profile.start');
             function granted(value) {
                 if (value === true || value === 1 || value === '1') return true;
                 return Number(value) > new Date().getTime() / 1000;
             }
-            profileNetwork.get(url, function (data) {
+            profileNetwork.get(url, 'user_profile', function (data) {
                 if (!alive) return;
-                var p = data.user_data || data;
-                if (p && !data.error && !data.errors && (p.user_id || p.login || p.is_pro != null || p.is_pro_plus != null)) {
+                if (looksLikeFilmix('user_profile', data)) {
+                    var p = data.user_data || data;
                     maxQuality = granted(p.is_pro_plus) ? 2160 : (granted(p.is_pro) ? 1080 : 720);
-                }
+                } else Lampa.Noty.show(tr('profile_error') + '. ' + tr('bad_response'));
                 log('profile.quality', maxQuality);
                 complete();
-            }, function (status) {
+            }, function (status, kind) {
                 if (!alive) return;
-                log('profile.error', status);
-                Lampa.Noty.show(tr('profile_error'));
+                Lampa.Noty.show(tr('profile_error') + '. ' + errorText(status, kind));
                 complete();
             });
         }
@@ -621,7 +653,7 @@
 
         if (!Lampa.Component.get(COMPONENT)) Lampa.Component.add(COMPONENT, FilmixScreen);
         Lampa.Manifest.plugins = {
-            type: 'video', version: '0.1.1', name: 'Lampa Online',
+            type: 'video', version: '0.1.2', name: 'Lampa Online',
             description: 'Filmix: онлайн-пошук та відтворення', component: COMPONENT,
             onContextMenu: function () { return { name: tr('watch'), description: 'Filmix (beta)' }; },
             onContextLauch: function (card) {
@@ -639,25 +671,25 @@
         });
         Lampa.SettingsApi.addParam({
             component: PREFIX + 'settings',
-            param: { name: PREFIX + 'api_url', type: 'input', default: API_DEFAULT, placeholder: API_DEFAULT },
+            param: { name: PREFIX + 'api_url', type: 'input', values: '', default: API_DEFAULT, placeholder: API_DEFAULT },
             field: { name: 'Filmix API URL', description: 'Адреса API (не адреса каталогу filmix.gg)' }
         });
         Lampa.SettingsApi.addParam({
             component: PREFIX + 'settings',
-            param: { name: PREFIX + 'token', type: 'input', default: '', placeholder: 'Filmix device token' },
+            param: { name: PREFIX + 'token', type: 'input', values: '', default: '', placeholder: 'Filmix device token' },
             field: { name: 'Filmix device token (необов’язково)', description: 'Токен власного облікового запису; не вводь пароль' }
         });
         Lampa.SettingsApi.addParam({
             component: PREFIX + 'settings',
-            param: { name: PREFIX + 'proxy', type: 'input', default: '', placeholder: 'https://your-trusted-proxy/' },
+            param: { name: PREFIX + 'proxy', type: 'input', values: '', default: '', placeholder: 'https://your-trusted-proxy/' },
             field: { name: 'HTTPS CORS-проксі (необов’язково)', description: 'Лише довірений проксі: він бачитиме запити й токен' }
         });
         Lampa.SettingsApi.addParam({
             component: PREFIX + 'settings',
-            param: { name: PREFIX + 'device_id', type: 'input', default: uid() },
+            param: { name: PREFIX + 'device_id', type: 'input', values: '', default: uid() },
             field: { name: 'Filmix device ID', description: 'Сталий ідентифікатор пристрою; для наявного токена збережи відповідний ID' }
         });
-        log('v0.1.1.ready');
+        log('v0.1.2.ready');
     }
 
     function bootstrap() {
