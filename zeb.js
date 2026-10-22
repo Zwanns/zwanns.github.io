@@ -1,5 +1,5 @@
 
-/* ZebMod v0.1.3 (formerly Lampa Online) — Filmix provider preview.
+/* ZebMod v0.1.4 diagnostic (formerly Lampa Online) — Filmix provider preview.
  * Standalone ES5 plugin. The Filmix API/network is not verified on user device.
  * Additional providers intentionally not implemented yet.
  */
@@ -152,6 +152,36 @@
         return tr('network_error');
     }
 
+    function clockMs() {
+        return window.performance && typeof window.performance.now === 'function' ? window.performance.now() : new Date().getTime();
+    }
+    function diagnostic(stage, status, kind, elapsed, json, filmix) {
+        status = Number(status);
+        elapsed = Number(elapsed);
+        return {
+            stage: stage === 'search' || stage === 'user_profile' ? stage : 'post',
+            transport: 'ajax',
+            status: status >= 100 && status <= 599 && status === Math.floor(status) ? status : 0,
+            kind: /^(none|error|timeout|parsererror|abort)$/.test(kind) ? kind : 'error',
+            elapsed: isFinite(elapsed) ? Math.max(0, Math.min(86400000, Math.round(elapsed))) : 0,
+            json: json === true || json === false ? json : 'unknown',
+            filmix: filmix === true || filmix === false ? filmix : 'unknown'
+        };
+    }
+    function diagnosticLog(info) {
+        // This object was built from scalar allowlisted fields, never from xhr/errors.
+        if (window.console && console.log) console.log('LampaOnline | diagnostic | stage=' + info.stage +
+            ' transport=' + info.transport + ' http=' + info.status + ' error=' + info.kind +
+            ' elapsed_ms=' + info.elapsed + ' json=' + info.json + ' filmix=' + info.filmix);
+    }
+    function configurationError(error) {
+        var keys = ['bad_api', 'bad_proxy', 'https_required'];
+        for (var i = 0; i < keys.length; i++) {
+            if (error && error.message === tr(keys[i])) return tr(keys[i]);
+        }
+        return tr('bad_api');
+    }
+
     // Reguest logs credential-bearing URLs and clear() does not abort HTTP.
     // Use Lampa's existing jQuery with an owned, cancellable request instead.
     function Network(timeout) {
@@ -168,12 +198,13 @@
         };
         this.get = function (url, stage, success, failure) {
             this.clear();
-            var current = generation, done = false;
+            var current = generation, done = false, startedAt = clockMs();
             networkLog(stage, 'start', 0, '', 'unknown', 'unknown');
             cancel = function () {
                 if (done) return;
                 done = true;
                 networkLog(stage, 'complete', 0, 'abort', 'unknown', 'unknown');
+                diagnosticLog(diagnostic(stage, 0, 'abort', clockMs() - startedAt));
             };
             function finish(data, status, kind, json) {
                 if (done || current !== generation) return;
@@ -182,10 +213,12 @@
                 clearTimeout(timer);
                 timer = null;
                 xhr = null;
-                networkLog(stage, 'complete', status, kind, json === undefined ? 'unknown' : json,
+                var info = diagnostic(stage, status, kind || 'none', clockMs() - startedAt, json,
                     json === true ? looksLikeFilmix(stage, data) : (json === false ? false : 'unknown'));
-                if (kind) failure(status || 0, kind);
-                else success(data);
+                networkLog(info.stage, 'complete', info.status, kind, info.json, info.filmix);
+                diagnosticLog(info);
+                if (kind) failure(info.status, info.kind, info);
+                else success(data, info);
             }
             timer = setTimeout(function () {
                 var pending = xhr;
@@ -249,6 +282,8 @@
         var resultQuery = searchTitle;
         var controller;
         var destroyed = false;
+        var busy = false, profileDiagnostic = null, profileRetryRow = null;
+        var resultDiagnostic = null, postDiagnostic = null, unsupportedMovie = false;
 
         function header(title, subtitle) {
             var line = $('<div class="lampa-online-head"></div>');
@@ -276,14 +311,19 @@
             scroll.reset();
             header(title, subtitle);
             addRow('← ' + tr('back'), '', goBack);
+            if (profileDiagnostic) showDiagnostic(profileDiagnostic);
         }
 
         function clearRows() {
             for (var i = 0; i < rows.length; i++) rows[i].off('.lampaonline').remove();
             rows = [];
+            profileRetryRow = null;
         }
 
         function restoreFocus() {
+            if (alive && !busy && profileDiagnostic && !profileRetryRow) {
+                profileRetryRow = addRow(tr('profile_retry'), tr('retry'), retryProfile);
+            }
             if (started && alive && Lampa.Controller.enabled().controller === controller) {
                 Lampa.Controller.collectionSet(scroll.render());
                 Lampa.Controller.collectionFocus(last || rows[focusMemory[stage]] || rows[0] || false, scroll.render());
@@ -291,12 +331,44 @@
         }
 
         function loading(value) {
+            busy = !!value;
             if (alive && self.activity) self.activity.loader(!!value);
         }
 
-        function fail(message, retry) {
+        function showDiagnostic(info, explanation) {
+            if (!alive || !info) return;
+            var box = $('<div class="lampa-online-diagnostic"></div>');
+            var lines = [tr('diagnostic'), tr('diag_stage') + ': ' + info.stage,
+                'Transport: WebView AJAX', 'HTTP: ' + info.status, 'Error: ' + info.kind,
+                tr('diag_elapsed') + ': ' + info.elapsed + ' ms',
+                'JSON: ' + info.json + ' · Filmix: ' + info.filmix];
+            if (!explanation) {
+                if (info.json === true && info.filmix === false) explanation = tr('bad_response');
+                else if (info.kind === 'none') explanation = tr('no_stream');
+                else if (info.kind === 'abort') explanation = tr('diag_abort');
+                else if (info.status === 0 && info.kind === 'error') explanation = tr('diag_unknown');
+                else explanation = errorText(info.status, info.kind);
+            }
+            lines.push(explanation);
+            for (var i = 0; i < lines.length; i++) box.append($('<div class="lampa-online-diagnostic-line"></div>').text(lines[i]));
+            scroll.append(box);
+        }
+
+        function retryProfile() {
+            profileDiagnostic = null;
+            stage = 'results';
+            requestSeq++;
+            network.clear();
+            begin(tr('name') + ' · Filmix · ' + tr('loading'), searchTitle);
+            loading(true);
+            restoreFocus();
+            fetchProfile(function () { if (alive) search(searchTitle); });
+        }
+
+        function fail(message, retry, info) {
             loading(false);
             if (!alive) return;
+            showDiagnostic(info);
             addRow(message || tr('network_error'), tr('retry'), retry);
             last = rows[rows.length - 1];
             restoreFocus();
@@ -307,12 +379,12 @@
             var seq = ++requestSeq;
             network.clear();
             try { url = apiUrl(path, extra); }
-            catch (e) { onError(e.message); return; }
-            network.get(url, path === 'search' ? 'search' : 'post', function (data) {
-                if (alive && seq === requestSeq) success(data);
-            }, function (status, kind) {
+            catch (e) { onError(configurationError(e)); return; }
+            network.get(url, path === 'search' ? 'search' : 'post', function (data, info) {
+                if (alive && seq === requestSeq) success(data, info);
+            }, function (status, kind, info) {
                 if (!alive || seq !== requestSeq) return;
-                onError(errorText(status, kind));
+                onError(errorText(status, kind), info);
             });
         }
 
@@ -324,16 +396,21 @@
                 if (value === true || value === 1 || value === '1') return true;
                 return Number(value) > new Date().getTime() / 1000;
             }
-            profileNetwork.get(url, 'user_profile', function (data) {
+            profileNetwork.get(url, 'user_profile', function (data, info) {
                 if (!alive) return;
                 if (looksLikeFilmix('user_profile', data)) {
                     var p = data.user_data || data;
                     maxQuality = granted(p.is_pro_plus) ? 2160 : (granted(p.is_pro) ? 1080 : 720);
-                } else Lampa.Noty.show(tr('profile_error') + '. ' + tr('bad_response'));
+                    profileDiagnostic = null;
+                } else {
+                    profileDiagnostic = info;
+                    Lampa.Noty.show(tr('profile_error') + '. ' + tr('bad_response'));
+                }
                 log('profile.quality', maxQuality);
                 complete();
-            }, function (status, kind) {
+            }, function (status, kind, info) {
                 if (!alive) return;
+                profileDiagnostic = info;
                 Lampa.Noty.show(tr('profile_error') + '. ' + errorText(status, kind));
                 complete();
             });
@@ -345,9 +422,10 @@
             loading(true);
             restoreFocus();
             if (!query) { fail(tr('missing_title'), function () { search(query); }); return; }
-            request('search', 'story=' + encodeURIComponent(query), function (data) {
+            request('search', 'story=' + encodeURIComponent(query), function (data, info) {
                 loading(false);
-                if (!Array.isArray(data)) { fail(tr('bad_response'), function () { search(query); }); return; }
+                resultDiagnostic = info;
+                if (!Array.isArray(data)) { fail(tr('bad_response'), function () { search(query); }, info); return; }
                 candidates = data.filter(function (item) { return item && /^\d+$/.test(String(item.id)); });
                 if (!candidates.length && !searchTried && originalTitle && originalTitle !== query) {
                     searchTried = true;
@@ -357,9 +435,9 @@
                 resultQuery = query;
                 log('search.results', candidates.length);
                 showResults();
-            }, function (err) {
+            }, function (err, info) {
                 begin(tr('name') + ' · Filmix · ' + tr('search'), query);
-                fail(err, function () { search(query); });
+                fail(err, function () { search(query); }, info);
             });
         }
 
@@ -367,7 +445,7 @@
             stage = 'results';
             begin(tr('name') + ' · Filmix · ' + tr('results'), resultQuery + (yearOf(object.movie) ? ' · ' + yearOf(object.movie) : ''));
             if (!candidates.length) {
-                fail(tr('nothing'), function () { search(resultQuery); });
+                fail(tr('nothing'), function () { search(resultQuery); }, resultDiagnostic && resultDiagnostic.filmix === false ? resultDiagnostic : null);
                 return;
             }
             for (var i = 0; i < candidates.length; i++) {
@@ -389,14 +467,17 @@
             begin(tr('name') + ' · Filmix · ' + tr('loading'), candidate.title || serialTitle);
             loading(true);
             restoreFocus();
-            request('post/' + encodeURIComponent(candidate.id), '', function (data) {
+            request('post/' + encodeURIComponent(candidate.id), '', function (data, info) {
                 loading(false);
-                if (!data || !data.player_links || typeof data.player_links !== 'object') {
-                    fail(tr('no_stream'), function () { openPost(candidate); });
+                postDiagnostic = info;
+                unsupportedMovie = false;
+                if (!data || !data.player_links || typeof data.player_links !== 'object' || Array.isArray(data.player_links)) {
+                    fail(tr('no_stream'), function () { openPost(candidate); }, info);
                     return;
                 }
                 sources = [];
                 var links = data.player_links;
+                unsupportedMovie = !!links.movie && !Array.isArray(links.movie) && ownKeys(links.movie).length > 0;
                 if (Array.isArray(links.movie)) {
                     for (var m = 0; m < links.movie.length; m++) {
                         var movie = links.movie[m];
@@ -427,8 +508,8 @@
                 }
                 log('post.sources', sources.length);
                 showSources();
-            }, function (err) {
-                fail(err, function () { openPost(candidate); });
+            }, function (err, info) {
+                fail(err, function () { openPost(candidate); }, info);
             });
         }
 
@@ -437,6 +518,7 @@
             begin(serialTitle, tr('name') + ' · Filmix · ' + tr('select'));
             if (!sources.length) {
                 header(tr('nothing'), tr('no_stream'));
+                if (unsupportedMovie) showDiagnostic(postDiagnostic, tr('diag_movie_object'));
                 restoreFocus();
                 return;
             }
@@ -590,6 +672,7 @@
             clearRows();
             last = false;
             candidates = sources = episodes = [];
+            profileDiagnostic = resultDiagnostic = postDiagnostic = profileRetryRow = null;
             if (controller) {
                 if (Lampa.Controller.enabled().controller === controller) Lampa.Controller.clear();
                 // Lampa has no Controller.remove(). Release captured screen references.
@@ -683,6 +766,13 @@
             lampa_online_back: { uk: 'Назад', ru: 'Назад', en: 'Back' },
             lampa_online_loading: { uk: 'Завантаження', ru: 'Загрузка', en: 'Loading' },
             lampa_online_retry: { uk: 'Натисни для повтору', ru: 'Нажмите для повтора', en: 'Press to retry' },
+            lampa_online_diagnostic: { uk: 'Діагностика Filmix', ru: 'Диагностика Filmix', en: 'Filmix diagnostics' },
+            lampa_online_diag_stage: { uk: 'Етап', ru: 'Этап', en: 'Stage' },
+            lampa_online_diag_elapsed: { uk: 'Час', ru: 'Время', en: 'Elapsed' },
+            lampa_online_diag_unknown: { uk: 'Причину не визначено: можливі мережа, DNS, CORS або TLS. HTTP 0 не є кодом відповіді сервера.', ru: 'Причина не определена: возможны сеть, DNS, CORS или TLS. HTTP 0 не является кодом ответа сервера.', en: 'Cause unknown: network, DNS, CORS or TLS may be involved. HTTP 0 is not a server response code.' },
+            lampa_online_diag_abort: { uk: 'Запит скасовано', ru: 'Запрос отменён', en: 'Request cancelled' },
+            lampa_online_diag_movie_object: { uk: 'Отримано movie як Object. Поточний парсер підтримує movie лише як Array; це обмеження клієнта, а не доказ мережевого збою.', ru: 'Получен movie как Object. Текущий парсер поддерживает movie только как Array; это ограничение клиента, а не доказательство сетевого сбоя.', en: 'Received movie as Object. The current parser supports movie only as Array; this is a client limitation, not evidence of network failure.' },
+            lampa_online_profile_retry: { uk: 'Повторити user_profile і пошук', ru: 'Повторить user_profile и поиск', en: 'Retry user_profile and search' },
             lampa_online_network_error: { uk: 'Помилка підключення до Filmix. Перевір API URL, мережу, HTTPS-сертифікат і CORS', ru: 'Ошибка соединения с Filmix. Проверьте API URL, сеть, HTTPS-сертификат и CORS', en: 'Filmix connection error. Check API URL, network, HTTPS certificate and CORS' },
             lampa_online_bad_api: { uk: 'Некоректна адреса Filmix API: потрібна базова адреса без параметрів', ru: 'Некорректный Filmix API URL: нужен базовый адрес без параметров', en: 'Invalid Filmix API base URL: remove query parameters' },
             lampa_online_bad_proxy: { uk: 'Для проксі потрібна базова HTTPS-адреса без параметрів', ru: 'Для прокси нужен базовый HTTPS-адрес без параметров', en: 'Proxy requires an HTTPS base URL without query parameters' },
@@ -712,6 +802,8 @@
             '.lampa-online-head{padding:1.2em 1.4em .65em;color:#fff}' +
             '.lampa-online-title{font-size:1.35em;font-weight:600;margin-bottom:.2em}' +
             '.lampa-online-muted{font-size:.82em;opacity:.66;margin-top:.28em;line-height:1.35}' +
+            '.lampa-online-diagnostic{margin:.7em 1.1em;padding:.85em 1.1em;border:1px solid rgba(255,255,255,.3);border-radius:.38em;color:#fff;line-height:1.45}' +
+            '.lampa-online-diagnostic-line{font-size:1em;word-wrap:break-word;margin:.12em 0}' +
             '.lampa-online-row{padding:.8em 1.35em;margin:.35em 1.1em;border-radius:.38em;' +
             'background:rgba(255,255,255,.065);color:#fff;cursor:pointer}' +
             '.lampa-online-row.focus{background:#fff;color:#181818}' +
@@ -721,7 +813,7 @@
 
         if (!Lampa.Component.get(COMPONENT)) Lampa.Component.add(COMPONENT, FilmixScreen);
         Lampa.Manifest.plugins = {
-            type: 'video', version: '0.1.3', name: 'ZebMod',
+            type: 'video', version: '0.1.4', name: 'ZebMod',
             description: 'Filmix: онлайн-пошук та відтворення', component: COMPONENT,
             onContextMenu: function () { return { name: tr('watch'), description: 'Filmix (beta)' }; },
             onContextLauch: openOnline
@@ -753,7 +845,7 @@
             field: { name: 'Filmix device ID', description: 'Сталий ідентифікатор пристрою; для наявного токена збережи відповідний ID' }
         });
         renameInstalledExtension();
-        log('v0.1.3.ready');
+        log('v0.1.4.ready');
     }
 
     function bootstrap() {
