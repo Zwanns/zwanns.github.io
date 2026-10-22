@@ -1,5 +1,5 @@
 
-/* Lampa Online v0.1.2 — Filmix provider preview.
+/* ZebMod v0.1.3 (formerly Lampa Online) — Filmix provider preview.
  * Standalone ES5 plugin. The Filmix API/network is not verified on user device.
  * Additional providers intentionally not implemented yet.
  */
@@ -341,7 +341,7 @@
 
         function search(query) {
             stage = 'results';
-            begin('Filmix · ' + tr('search'), query);
+            begin(tr('name') + ' · Filmix · ' + tr('search'), query);
             loading(true);
             restoreFocus();
             if (!query) { fail(tr('missing_title'), function () { search(query); }); return; }
@@ -358,14 +358,14 @@
                 log('search.results', candidates.length);
                 showResults();
             }, function (err) {
-                begin('Filmix · ' + tr('search'), query);
+                begin(tr('name') + ' · Filmix · ' + tr('search'), query);
                 fail(err, function () { search(query); });
             });
         }
 
         function showResults() {
             stage = 'results';
-            begin('Filmix · ' + tr('results'), resultQuery + (yearOf(object.movie) ? ' · ' + yearOf(object.movie) : ''));
+            begin(tr('name') + ' · Filmix · ' + tr('results'), resultQuery + (yearOf(object.movie) ? ' · ' + yearOf(object.movie) : ''));
             if (!candidates.length) {
                 fail(tr('nothing'), function () { search(resultQuery); });
                 return;
@@ -386,7 +386,7 @@
             focusMemory.sources = 0;
             focusMemory.episodes = 0;
             serialTitle = titleOf(candidate) || searchTitle;
-            begin('Filmix · ' + tr('loading'), candidate.title || serialTitle);
+            begin(tr('name') + ' · Filmix · ' + tr('loading'), candidate.title || serialTitle);
             loading(true);
             restoreFocus();
             request('post/' + encodeURIComponent(candidate.id), '', function (data) {
@@ -434,7 +434,7 @@
 
         function showSources() {
             stage = 'sources';
-            begin(serialTitle, 'Filmix · ' + tr('select'));
+            begin(serialTitle, tr('name') + ' · Filmix · ' + tr('select'));
             if (!sources.length) {
                 header(tr('nothing'), tr('no_stream'));
                 restoreFocus();
@@ -485,7 +485,7 @@
             }
             episodes.sort(function (a, b) { return a.number - b.number; });
             stage = 'episodes';
-            begin(source.title, tr('episode_select'));
+            begin(source.title, tr('name') + ' · Filmix · ' + tr('episode_select'));
             if (!episodes.length) {
                 header(tr('no_stream'), 'Filmix');
             } else {
@@ -549,7 +549,7 @@
         this.create = function () {
             if (alive || destroyed) return this.render();
             alive = true;
-            begin('Filmix · ' + tr('loading'), searchTitle);
+            begin(tr('name') + ' · Filmix · ' + tr('loading'), searchTitle);
             loading(true);
             fetchProfile(function () { if (alive) search(searchTitle); });
             return this.render();
@@ -602,14 +602,82 @@
         this.render = function () { return scroll.render(); };
     }
 
+    function openOnline(card) {
+        card = card || {};
+        Lampa.Activity.push({
+            url: '', title: tr('name'), component: COMPONENT,
+            movie: card, search: titleOf(card), page: 1
+        });
+    }
+
+    function addFullSource(event) {
+        if (!event || event.type !== 'complite' || !event.data || !event.data.movie) return;
+        var activity = event.object && event.object.activity;
+        var root = activity && typeof activity.render === 'function' ? activity.render() : event.body;
+        if (!root || typeof root.find !== 'function') return;
+        // Lampa groups direct source children after the full/complite listeners run.
+        // Keep every query inside this card; never attach to another activity's DOM.
+        var container = root.find('.buttons--container').first();
+        if (!container.length) return;
+        var card = event.data.movie;
+        var button = container.children('.view--lampa-online').first();
+        if (!button.length) {
+            button = $('<div class="full-start__button selector view--lampa-online">' +
+                '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+                '<circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>' +
+                '<path d="M9 7L17 12L9 17V7Z" fill="currentColor"/></svg>' +
+                '<span>ZebMod</span></div>');
+            var torrent = container.children('.view--torrent').last();
+            if (torrent.length) torrent.after(button);
+            else container.append(button);
+        }
+        // Repeated completion for the same DOM refreshes card data, not handlers.
+        button.off('.lampaOnlineSource').on('hover:enter.lampaOnlineSource', function () {
+            openOnline(card);
+        });
+    }
+
+    function renameInstalledExtension() {
+        if (!Lampa.Plugins || typeof Lampa.Plugins.get !== 'function') return;
+        function ownIndex(list) {
+            if (!Array.isArray(list)) return -1;
+            var index = -1;
+            for (var i = 0; i < list.length; i++) {
+                if (list[i] && list[i].url === 'https://zwanns.github.io/zeb.js') {
+                    if (index !== -1) return -1;
+                    index = i;
+                }
+            }
+            return index;
+        }
+        try {
+            // Plugins.get() returns a shallow array of local installed records.
+            // Require one exact URL in both lists; never infer identity from a name.
+            var installed = Lampa.Plugins.get();
+            var stored = Lampa.Storage.get('plugins', []);
+            var liveIndex = ownIndex(installed), storedIndex = ownIndex(stored);
+            if (liveIndex < 0 || storedIndex < 0) return;
+            if (stored[storedIndex].name !== 'ZebMod') {
+                var entry = {}, updated = stored.slice();
+                Object.keys(stored[storedIndex]).forEach(function (key) { entry[key] = stored[storedIndex][key]; });
+                entry.name = 'ZebMod';
+                updated[storedIndex] = entry;
+                // Preserve the fresh stored list and all unrelated metadata. Avoid
+                // Plugins.save(), which logs the entire list including private URLs.
+                Lampa.Storage.set('plugins', updated);
+            }
+            installed[liveIndex].name = 'ZebMod';
+        } catch (ignored) { /* Optional host metadata must not prevent plugin startup. */ }
+    }
+
     function init() {
         if (initialized) return;
         initialized = true;
         if (readyHandler) Lampa.Listener.remove('app', readyHandler);
 
         Lampa.Lang.add({
-            lampa_online_name: { uk: 'Lampa Online', ru: 'Lampa Online', en: 'Lampa Online' },
-            lampa_online_watch: { uk: 'Дивитися через Lampa Online', ru: 'Смотреть через Lampa Online', en: 'Watch via Lampa Online' },
+            lampa_online_name: { uk: 'ZebMod', ru: 'ZebMod', en: 'ZebMod' },
+            lampa_online_watch: { uk: 'Дивитися через ZebMod', ru: 'Смотреть через ZebMod', en: 'Watch via ZebMod' },
             lampa_online_search: { uk: 'Пошук', ru: 'Поиск', en: 'Search' },
             lampa_online_results: { uk: 'Результати пошуку', ru: 'Результаты поиска', en: 'Search results' },
             lampa_online_back: { uk: 'Назад', ru: 'Назад', en: 'Back' },
@@ -653,20 +721,15 @@
 
         if (!Lampa.Component.get(COMPONENT)) Lampa.Component.add(COMPONENT, FilmixScreen);
         Lampa.Manifest.plugins = {
-            type: 'video', version: '0.1.2', name: 'Lampa Online',
+            type: 'video', version: '0.1.3', name: 'ZebMod',
             description: 'Filmix: онлайн-пошук та відтворення', component: COMPONENT,
             onContextMenu: function () { return { name: tr('watch'), description: 'Filmix (beta)' }; },
-            onContextLauch: function (card) {
-                card = card || {};
-                Lampa.Activity.push({
-                    url: '', title: tr('name'), component: COMPONENT,
-                    movie: card, search: titleOf(card), page: 1
-                });
-            }
+            onContextLauch: openOnline
         };
+        Lampa.Listener.follow('full', addFullSource);
 
         Lampa.SettingsApi.addComponent({
-            component: PREFIX + 'settings', name: 'Lampa Online',
+            component: PREFIX + 'settings', name: 'ZebMod',
             icon: '<svg width="44" height="44" viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="5" y="9" width="34" height="26" rx="4" stroke="currentColor" stroke-width="3"/><path d="M18 16L29 22L18 28V16Z" fill="currentColor"/></svg>'
         });
         Lampa.SettingsApi.addParam({
@@ -689,7 +752,8 @@
             param: { name: PREFIX + 'device_id', type: 'input', values: '', default: uid() },
             field: { name: 'Filmix device ID', description: 'Сталий ідентифікатор пристрою; для наявного токена збережи відповідний ID' }
         });
-        log('v0.1.2.ready');
+        renameInstalledExtension();
+        log('v0.1.3.ready');
     }
 
     function bootstrap() {
