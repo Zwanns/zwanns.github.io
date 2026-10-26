@@ -11,6 +11,7 @@
     var COMPONENT = 'lampa_online_filmix_screen';
     var PROVIDERS_COMPONENT = 'lampa_online_provider_screen';
     var REZKA_COMPONENT = 'lampa_online_rezka_screen';
+    var TRANSPORT_COMPONENT = 'lampa_online_transport_diagnostics';
     var REZKA_ORIGIN = 'https://rezka.ag';
     var API_DEFAULT = 'https://filmixapp.cyou/api/v2/';
 
@@ -19,6 +20,13 @@
 
     var initialized = false;
     var readyHandler;
+    // Capture the executing script, never infer the channel from installed URLs.
+    // Unknown/inline cached scripts fail closed; no persistent diagnostic setting.
+    var experimentalDiagnostics = false;
+    var transportSession = { blocked: false, nativeUncertain: false };
+    try {
+        experimentalDiagnostics = /^https:\/\/zwanns\.github\.io\/zeb-test\.js(?:[?#].*)?$/.test(document.currentScript.src);
+    } catch (ignored) {}
 
     function tr(key) { return Lampa.Lang.translate(PREFIX + key); }
     function setting(key, fallback) {
@@ -878,7 +886,7 @@
         };
     }
 
-    // Shared only by the two new components; FilmixScreen remains independent.
+    // Shared by provider/Rezka/diagnostic UI; FilmixScreen remains independent.
     function ProviderPanel(owner, back) {
         var scroll = new Lampa.Scroll({ mask: true, over: true }), rows = [], last = false, focus = {}, page = '';
         var alive = false, destroyed = false, started = false, controller;
@@ -892,7 +900,7 @@
                 Lampa.Controller.collectionFocus(last || rows[focus[page]] || rows[0], scroll.render());
             }
         };
-        this.draw = function (key, title, subtitle, entries, info) {
+        this.draw = function (key, title, subtitle, entries, info, metadata) {
             if (!alive) return;
             clearRows(); scroll.clear(); scroll.reset(); page = key;
             var head = $('<div class="lampa-online-head"></div>');
@@ -905,6 +913,11 @@
                     'error: ' + info.kind, 'elapsed: ' + info.elapsed + ' ms', 'response type: ' + info.type,
                     tr('rezka_' + info.kind)].forEach(function (line) { box.append($('<div class="lampa-online-diagnostic-line"></div>').text(line)); });
                 scroll.append(box);
+            }
+            if (metadata && metadata.length) {
+                var details = $('<div class="lampa-online-diagnostic"></div>');
+                metadata.forEach(function (line) { details.append($('<div class="lampa-online-diagnostic-line"></div>').text(line)); });
+                scroll.append(details);
             }
             [{ title: '← ' + tr('back'), action: back }].concat(entries).forEach(function (entry, index) {
                 var row = $('<div class="lampa-online-row selector"></div>');
@@ -947,14 +960,148 @@
         this.create = function () {
             if (panel.create()) {
                 panel.loading(false);
-                panel.draw('providers', tr('name'), titleOf(movie), [
+                var entries = [
                     { title: 'Rezka', sub: tr('rezka_experimental'), action: function () { pushProvider(REZKA_COMPONENT, movie, 'Rezka'); } },
                     { title: 'Filmix', action: function () { pushProvider(COMPONENT, movie, 'Filmix'); } }
-                ]);
+                ];
+                if (experimentalDiagnostics) entries.push({ title: tr('transport_title'), action: function () {
+                    pushProvider(TRANSPORT_COMPONENT, movie, tr('transport_title'));
+                } });
+                panel.draw('providers', tr('name'), titleOf(movie), entries);
             }
             return panel.render();
         };
         this.start = panel.start; this.stop = panel.stop; this.pause = panel.stop; this.destroy = panel.destroy; this.render = panel.render;
+    }
+
+    function TransportDiagnosticsScreen() {
+        var self = this, results = {}, generation = 0, timer = null, xhr = null, nativeRequest = null;
+        var busy = false, destroyed = false;
+        var panel = new ProviderPanel(this, function () { self.destroy(); Lampa.Activity.backward(); });
+        var TARGET = 'https://rezka.ag/', LIMIT = 65536;
+        function anonymousOrigin() {
+            try {
+                return /^(https?:|file:)$/.test(window.location.protocol) &&
+                    typeof window.location.hostname === 'string' && window.location.hostname.toLowerCase() !== 'rezka.ag';
+            } catch (ignored) { return false; }
+        }
+        function nativeAvailable() {
+            try {
+                // Audited APK profile only. Older Android builds may trust all TLS
+                // certificates; unknown wrappers/PAC configurations are not tested.
+                var android = /Android\s+(\d+)/.exec(window.navigator.userAgent);
+                return android && Number(android[1]) >= 10 && Lampa.Platform && Lampa.Platform.is('android') &&
+                    typeof Lampa.Reguest === 'function' && Lampa.Android && typeof Lampa.Android.httpReq === 'function' &&
+                    window.AndroidJS && typeof AndroidJS.httpReq === 'function' && typeof AndroidJS.getResp === 'function' &&
+                    typeof AndroidJS.appVersion === 'function' && AndroidJS.appVersion() === '1.13.5-581' &&
+                    typeof AndroidJS.getProxyPAC === 'function' && AndroidJS.getProxyPAC() === '';
+            } catch (ignored) { return false; }
+        }
+        function record(transport, outcome, status, elapsed, type, challenge, category) {
+            status = Number(status);
+            return { transport: transport === 'native' ? 'Lampa.Reguest.native / Android bridge' : 'WebView AJAX', outcome: outcome,
+                status: status >= 100 && status <= 599 && status === Math.floor(status) ? status : 'unknown',
+                elapsed: isFinite(elapsed) ? Math.max(0, Math.min(86400000, Math.round(elapsed))) : 0,
+                type: type, challenge: challenge, category: category };
+        }
+        function draw() {
+            if (destroyed || !panel.active()) return;
+            var lines = [];
+            ['ajax', 'native'].forEach(function (name) {
+                var info = results[name];
+                if (!info) return;
+                lines = lines.concat(['transport: ' + info.transport, 'outcome: ' + info.outcome,
+                    'HTTP: ' + info.status, 'elapsed: ' + info.elapsed + ' ms', 'response type: ' + info.type,
+                    'challenge detected: ' + info.challenge, 'error category: ' + info.category]);
+            });
+            var note = transportSession.blocked ? tr('transport_blocked') :
+                transportSession.nativeUncertain ? tr('transport_pending') : tr('transport_manual');
+            panel.draw('transport-tests', tr('transport_title'), note, [
+                { title: 'WebView AJAX', action: function () { run('ajax'); } },
+                { title: 'Lampa.Reguest.native()', action: function () { run('native'); } }
+            ], null, lines);
+        }
+        function clearOwned() {
+            clearTimeout(timer); timer = null;
+            var pending = xhr; xhr = null;
+            if (pending && pending.abort) { try { pending.abort(); } catch (ignored) {} }
+            // Callback cleanup only: this does not cancel the native HTTP call.
+            if (nativeRequest && nativeRequest.clear) { try { nativeRequest.clear(); } catch (ignored) {} }
+            nativeRequest = null;
+        }
+        function run(transport) {
+            if (!experimentalDiagnostics || destroyed || busy || transportSession.blocked || transportSession.nativeUncertain) return;
+            if (!anonymousOrigin() || (transport === 'native' && !nativeAvailable())) {
+                results[transport] = record(transport, 'NOT AVAILABLE', 0, 0, 'unknown', 'unknown', 'unavailable'); draw(); return;
+            }
+            var current = ++generation, started = clockMs(), done = false;
+            function finish(body, status, category, nativeCompleted) {
+                if (done || current !== generation || destroyed) return;
+                done = true; clearTimeout(timer); timer = null; busy = false;
+                if (transport === 'native' && nativeCompleted) transportSession.nativeUncertain = false;
+                var type = 'unknown', challenge = 'unknown', auth = false;
+                if (transport === 'native' && body === '[Response too large, skipped]') {
+                    body = null; category = 'body_unavailable';
+                }
+                if (typeof body === 'string') {
+                    // Keep only a bounded fragment in local variables; never put it
+                    // in DOM, logs, Storage, request diagnostics or exception text.
+                    var sample = body.slice(0, LIMIT);
+                    var gate = /cf-chl-|challenge-platform|checking your browser|just a moment|captcha|проверяем,?\s*что вы не бот|verify you are human|\.within\.website\/|проверка браузера|перевірка браузера/i.test(sample);
+                    auth = /<form\b[^>]*(?:id|class)=["'][^"']*(?:login|auth)[^"']*["']/i.test(sample) &&
+                        !/initCDN(?:Movies|Series)Events|b-content__inline_item-link|class=["']enty["']/i.test(sample);
+                    challenge = gate ? 'yes' : body.length <= LIMIT ? 'no' : 'unknown';
+                    if (auth && !gate) challenge = 'unknown';
+                    type = !body.length ? 'empty' : /<\w/.test(sample) ? 'html' : 'text';
+                    if (type === 'text' && body.length <= LIMIT && /^\s*[\[{]/.test(sample)) {
+                        try { JSON.parse(sample); type = 'json'; } catch (ignored) {}
+                    }
+                }
+                var denied = Number(status) === 401 || Number(status) === 403 || Number(status) === 429;
+                var blocked = challenge === 'yes' || denied || auth;
+                if (blocked) transportSession.blocked = true;
+                var outcome = blocked ? 'BLOCKED' : category === 'timeout' ? 'TIMEOUT' :
+                    category === 'none' || category === 'body_unavailable' ? 'HTTP RESPONSE' : 'ERROR';
+                results[transport] = record(transport, outcome, status, clockMs() - started, type, challenge, blocked ? 'blocked' : category);
+                // Set done first: abort/clear may synchronously invoke callbacks.
+                clearOwned(); panel.loading(false); draw();
+            }
+            busy = true;
+            results[transport] = record(transport, 'RUNNING', 0, 0, 'unknown', 'unknown', 'none'); draw(); panel.loading(true);
+            timer = setTimeout(function () { finish(null, 0, 'timeout', false); }, 15000);
+            try {
+                if (transport === 'native') {
+                    nativeRequest = new Lampa.Reguest();
+                    if (typeof nativeRequest.native !== 'function' || typeof nativeRequest.clear !== 'function') {
+                        finish(null, 0, 'unavailable', true);
+                        results[transport].outcome = 'NOT AVAILABLE'; draw(); return;
+                    }
+                    transportSession.nativeUncertain = true;
+                    // Platform/bridge preflight prevents the audited browser AJAX
+                    // fallback. Do not intercept or replace any global host method.
+                    nativeRequest.native(TARGET, function (body) {
+                        finish(typeof body === 'string' ? body : null, 0, typeof body === 'string' ? 'none' : 'unsupported_body', true);
+                    }, function (response) {
+                        finish(null, response && response.status, 'network', true);
+                    }, false, { dataType: 'text', timeout: 15000 });
+                } else {
+                    var pending = $.ajax({ url: TARGET, type: 'GET', dataType: 'text', timeout: 15000,
+                        crossDomain: true, global: false, xhrFields: { withCredentials: false },
+                        success: function (body, ignored, response) { finish(body, response && response.status, 'none', false); },
+                        error: function (response, category) {
+                            finish(response && typeof response.responseText === 'string' ? response.responseText : null,
+                                response && response.status, category === 'timeout' ? 'timeout' : 'network', false);
+                        } });
+                    if (!done) xhr = pending;
+                }
+            } catch (ignored) { finish(null, 0, 'exception', false); }
+        }
+        this.create = function () { if (panel.create()) draw(); return panel.render(); };
+        this.start = panel.start; this.stop = panel.stop; this.pause = panel.stop; this.render = panel.render;
+        this.destroy = function () {
+            if (destroyed) return;
+            destroyed = true; generation++; busy = false; clearOwned(); panel.destroy(); results = {};
+        };
     }
     function RezkaScreen(object) {
         object = object || {};
@@ -1126,6 +1273,10 @@
         if (readyHandler) Lampa.Listener.remove('app', readyHandler);
 
         Lampa.Lang.add({
+            lampa_online_transport_title: { uk: 'Діагностика транспортів · experimental', ru: 'Диагностика транспортов · experimental', en: 'Transport diagnostics · experimental' },
+            lampa_online_transport_manual: { uk: 'Лише головна Rezka. OK запускає один тест; плагін не повторює запит. Redirects і відновлення з’єднання контролює оболонка.', ru: 'Только главная Rezka. OK запускает один тест; плагин не повторяет запрос. Redirects и восстановление соединения контролирует оболочка.', en: 'Rezka homepage only. OK starts one test; the plugin does not retry. Redirects and connection recovery are controlled by the host.' },
+            lampa_online_transport_blocked: { uk: 'BLOCKED: доступ обмежено. Подальші тести зупинено до повного перезапуску Lampa.', ru: 'BLOCKED: доступ ограничен. Дальнейшие тесты остановлены до полного перезапуска Lampa.', en: 'BLOCKED: access restricted. Further tests stopped until a full Lampa restart.' },
+            lampa_online_transport_pending: { uk: 'Завершення Native невідоме. clear() не скасовує HTTP; нові тести зупинено до перезапуску.', ru: 'Завершение Native неизвестно. clear() не отменяет HTTP; новые тесты остановлены до перезапуска.', en: 'Native completion unknown. clear() does not cancel HTTP; new tests stopped until restart.' },
             lampa_online_name: { uk: 'ZebMod', ru: 'ZebMod', en: 'ZebMod' },
             lampa_online_rezka_experimental: { uk: 'Експериментальний адаптер. Живий пошук і відтворення не підтверджені; можливі CORS та захист від ботів.', ru: 'Экспериментальный адаптер. Живой поиск и воспроизведение не подтверждены; возможны CORS и защита от ботов.', en: 'Experimental adapter. Live search and playback unverified; CORS and anti-bot protection may prevent access.' },
             lampa_online_rezka_default_voice: { uk: 'Озвучення сайту', ru: 'Озвучка сайта', en: 'Site default audio' },
@@ -1199,6 +1350,7 @@
         if (!Lampa.Component.get(COMPONENT)) Lampa.Component.add(COMPONENT, FilmixScreen);
         if (!Lampa.Component.get(PROVIDERS_COMPONENT)) Lampa.Component.add(PROVIDERS_COMPONENT, ProviderScreen);
         if (!Lampa.Component.get(REZKA_COMPONENT)) Lampa.Component.add(REZKA_COMPONENT, RezkaScreen);
+        if (experimentalDiagnostics && !Lampa.Component.get(TRANSPORT_COMPONENT)) Lampa.Component.add(TRANSPORT_COMPONENT, TransportDiagnosticsScreen);
         Lampa.Manifest.plugins = {
             type: 'video', version: '0.1.5', name: 'ZebMod',
             description: 'Rezka (experimental), Filmix', component: PROVIDERS_COMPONENT,
